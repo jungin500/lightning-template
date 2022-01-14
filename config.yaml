@@ -1,0 +1,26 @@
+dataloader:
+  dataset_path: "/dataset/"
+  batch_size: 64
+  num_workers: 4
+  num_classes: 3
+  validset_portion: 0.3
+
+model:
+  pretrained_path: './pretrained_model.pth'
+  args:
+    width_mult: 0.35
+  pretrained: False
+
+train:
+  checkpoint_base_dir: './checkpoints'
+  precision: 16
+  gpus: 0
+  epochs: 200
+  lr: 0.01
+  optimizer_params:
+    lr_scheduler:
+      milestones: [60, 65]
+
+wandb:
+  name: '220114-custom-model-width0.35-scratch'
+  project: 'custom-model-project'

@@ -1,0 +1,12 @@
+# User-installation packages!
+# User shall install packages via conda, or with pip.
+# torch
+# torchvision
+
+albumentations
+wandb
+pytorch_lightning
+hydra-core
+opencv-python-headless
+numpy
+loguru
