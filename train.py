@@ -1,98 +1,166 @@
-import torch
-from torch import optim
-from torch.utils.data import DataLoader, random_split
-from torch.utils.data.dataset import Dataset
+from torch.utils.data import DataLoader
 
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, TQDMProgressBar, EarlyStopping
+from pytorch_lightning.plugins import DDPPlugin
 
 from model import LightningModel
-from dataset import TargetDataset
 
 import hydra
 from omegaconf import DictConfig
 from loguru import logger
 import os
 
-import albumentations as A
+# import albumentations as A
+# from albumentations.pytorch import ToTensorV2
+import torchvision.transforms as T
+from torchvision.datasets import ImageNet
 
 @hydra.main(config_path=".", config_name="config")
 def main(config: DictConfig) -> None:
+    base_dir = config.train.base_dir
+    checkpoint_dir = os.path.join(base_dir, 'checkpoints')
     
-    wandb_logger = WandbLogger(
-        name=config.wandb.name,
-        project=config.wandb.project
-    )
+    # directory internally used by pytorch lightning
+    trainer_root_dir = os.path.join(base_dir, 'trainer')
+    os.makedirs(trainer_root_dir, exist_ok=True)
     
-    transform = A.Compose([
-        A.Flip(p=0.5), # HorizontalFlip + VerticalFlip
-        A.RandomBrightnessContrast(p=0.2),
-        A.Rotate(limit=(-30, 30), p=0.3),
-        A.Resize(width=224, height=224),
-    ])
-    test_transform = A.Compose([
-        A.Resize(width=224, height=224)
-    ])
+    wandb_enabled = bool(config.wandb.enabled)
     
-    dataset = TargetDataset(
-        dataset_path=config.dataloader.dataset_path,
-        transform=transform, test_transform=test_transform
-    )
+    if not os.path.exists(checkpoint_dir):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        logger.info(f"Created checkpoint directory {checkpoint_dir}")
     
-    total_items = len(dataset)
-    trainset_items = int(total_items * (1.0 - config.dataloader.validset_portion))
-    valset_items = total_items - trainset_items
-    train_dataset, val_dataset = random_split(dataset, [trainset_items, valset_items])
+    if wandb_enabled:    
+        # directory internally used by wandb
+        wandb_log_dir = os.path.join(base_dir, 'wandb')
+        os.makedirs(wandb_log_dir, exist_ok=True)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.dataloader.batch_size,
-        shuffle=True,
-        num_workers=config.dataloader.num_workers,
-        pin_memory=True
-    )
+        if config.wandb.login_key != 'None' and config.wandb.login_key is not None:
+            import wandb
+            wandb.login(key=config.wandb.login_key)
+        
+        lightning_logger = WandbLogger(
+            name=config.expr_name,
+            project=config.wandb.project,
+            save_dir=base_dir
+        )
+    else:
+        lightning_logger = True
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.dataloader.batch_size,
-        shuffle=False,
-        num_workers=config.dataloader.num_workers,
-        pin_memory=True
-    )
     
-    model = LightningModel(
-        pretrained_path=config.model.pretrained_path,
-        lr=config.train.lr,
-        epoch_milestones=config.train.optimizer_params.lr_scheduler.milestones,
-        model_args=config.model.args,
-        num_classes=config.dataloader.num_classes,
-        pretrained=config.model.pretrained
-    )
+    if config.dataloader.use_dali:
+        pass  # Initializing inside model
+    else:
+        train_transform = T.Compose([
+            T.Resize([224, 224]),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.5),
+            T.RandomAutocontrast(p=0.5),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        val_transform = T.Compose([
+            T.Resize([224, 224]),
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+        
+        logger.info("Loading trainset")
+        train_dataset = ImageNet(
+            root=config.dataloader.basepath,
+            split='train',
+            transform=train_transform,
+            # target_transform=target_transform
+        )
+        logger.info("Done loading trainset")
+        
+        logger.info("Loading validset")
+        val_dataset = ImageNet(
+            root=config.dataloader.basepath,
+            split='val',
+            transform=val_transform,
+            # target_transform=target_transform
+        )
+        logger.info("Done loading validset")
+        
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.dataloader.batch_size,
+            shuffle=True,
+            num_workers=config.dataloader.num_workers,
+            pin_memory=True,
+            persistent_workers=True
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=64,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True
+        )
+
+    model = LightningModel(config)
     
+    if wandb_enabled:
+        lightning_logger.watch(model)
+
     if config.train.gpus == 0:
         logger.warning("Training with CPU, falling back to BF16 format")
-    
+
+    strategy = None
+    if config.train.strategy and config.train.strategy.lower() != 'none':
+        strategy = config.train.strategy
+        if strategy.lower() == 'ddp':
+            strategy = DDPPlugin(find_unused_parameters=False)
+        
     trainer = pl.Trainer(
-        logger=wandb_logger,
-        default_root_dir=os.path.join(os.getcwd(), config.train.checkpoint_base_dir),
+        logger=lightning_logger,
+        default_root_dir=trainer_root_dir,
         accelerator='gpu' if config.train.gpus > 0 else 'cpu',
         gpus=config.train.gpus,
+        strategy=strategy,
         precision=config.train.precision if config.train.gpus > 0 else 'bf16',
         max_epochs=config.train.epochs,
+        limit_train_batches=config.train.limit_train_batches,
+        limit_val_batches=config.train.limit_val_batches,
+        enable_progress_bar=not config.headless,
         callbacks=[
-            TQDMProgressBar(refresh_rate=1),
-            ModelCheckpoint(save_weights_only=True, mode="max", monitor="valid_acc"),
-            LearningRateMonitor("epoch")
+            # TQDMProgressBar(refresh_rate=1),
+            ModelCheckpoint(
+                dirpath=checkpoint_dir,
+                filename='%s-epoch{epoch:04d}-val_acc{validation/accuracy:.2f}' % (config.expr_name),
+                mode="max", monitor="validation/f1"
+                ),
+            LearningRateMonitor("epoch"),
+            EarlyStopping(
+                monitor="validation/accuracy",
+                patience=5,
+                min_delta=0.005,
+                mode="max",
+                )
         ]
     )
-    
-    trainer.logger._log_graph = True
-    trainer.logger._default_hp_metric = None
-    
-    logger.info("Start training from epoch 0")
-    trainer.fit(model, train_loader, val_loader)
-    
+
+    if wandb_enabled:
+        trainer.logger._log_graph = True
+        trainer.logger._default_hp_metric = None
+
+    if config.dataloader.use_dali:
+        trainer.fit(model)  # Dataloader is initialized inside model
+    else:            
+        trainer.fit(model, train_loader, val_loader)
+
 
 if __name__ == '__main__':
     main()
