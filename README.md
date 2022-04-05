@@ -1,5 +1,21 @@
 Easy-to-use PyTorch Lightning CNN model training template with **MobileNetV2** and **ImageNet** dataloader example
 
+# Usage (`conda` recommended)
+```bash
+# Change "torch-trainer" to your new environment name
+export CONDA_ENV=torch-trainer
+
+# Create new environment along with PyTorch (with GPU support compatible up to RTX 3xxx series)
+conda create -n $CONDA_ENV -c pytorch python=3.9 pytorch torchvision cudatoolkit=11.3
+conda activate $CONDA_ENV
+pip3 install -r requirements.txt
+
+# ... Edit model, configuration
+
+# Go ahead training your model!
+python3 train.py wandb.login_key=123abc model.type=large ...
+```
+
 ## Details
 - [PyTorch Lightning](https://www.pytorchlightning.ai/) for easy-to-use NVIDIA AMP(Automatic Mixed Precision) and Tensorflow-like callback functions (`pytorch_lightning.callbacks.ModelCheckpoint`, `pytorch_lightning.callbacks.LearningRateMonitor`, so on)
 - [Wandb](https://wandb.ai) for hyperparameters, loss, accuracy, model parameters and GPU usage logging
